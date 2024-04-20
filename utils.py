@@ -1,183 +1,122 @@
-from osgeo import gdal
-from osgeo import osr
-import torch
-from torch.nn.functional import interpolate
+#!/usr/bin/env python
+# coding=utf-8
+
+import os, math, torch,cv2
+import torch.nn as nn
 import numpy as np
-from numpy.random import random
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MultipleLocator
+from utils.vgg import VGG
+import torch.nn.functional as F
 
+def maek_optimizer(opt_type, cfg, params):
+    if opt_type == "ADAM":
+        optimizer = torch.optim.Adam(params, lr=cfg['schedule']['lr'], betas=(cfg['schedule']['beta1'], cfg['schedule']['beta2']), eps=cfg['schedule']['epsilon'])
+    elif opt_type == "SGD":
+        optimizer = torch.optim.SGD(params, lr=cfg['schedule']['lr'], momentum=cfg['schedule']['momentum'])
+    elif opt_type == "RMSprop":
+        optimizer = torch.optim.RMSprop(params, lr=cfg['schedule']['lr'], alpha=cfg['schedule']['alpha'])
+    else:
+        raise ValueError
+    return optimizer
 
-def _is_pan_image(filename):
-    return filename.endswith("pan.tif")
+def make_loss(loss_type):
+    # loss = {}
+    if loss_type == "MSE":
+        loss = nn.MSELoss(reduction='sum')
+    elif loss_type == "L1":
+        loss = nn.L1Loss(reduction='sum')
+    elif loss_type == "MEF_SSIM":
+        loss = MEF_SSIM_Loss()
+    elif loss_type == "VGG22":
+        loss = VGG(loss_type[3:], rgb_range=255)
+    elif loss_type == "VGG54":
+        loss = VGG(loss_type[3:], rgb_range=255)
+    else:
+        raise ValueError
+    return loss
 
+def get_path(subdir):
+    return os.path.join(subdir)
 
-def get_image_id(filename):
-    return filename.split('_')[0]
+def save_config(time, log):
+    open_type = 'a' if os.path.exists(get_path('./log/' + str(time) + '/records.txt'))else 'w'
+    log_file = open(get_path('./log/' + str(time) + '/records.txt'), open_type)
+    log_file.write(str(log) + '\n')
 
+def save_net_config(time, log):
+    open_type = 'a' if os.path.exists(get_path('./log/' + str(time) + '/net.txt'))else 'w'
+    log_file = open(get_path('./log/' + str(time) + '/net.txt'), open_type)
+    log_file.write(str(log) + '\n')
 
-def load_image(path):
-    """ Load .TIF image to np.array
+def calculate_psnr(img1, img2, pixel_range=255, color_mode='rgb'):
+    # transfer color channel to y
+    if color_mode == 'rgb':
+        img1 = (img1 * np.array([0.256789, 0.504129, 0.097906])).sum(axis=2) + 16 / 255 * pixel_range
+        img2 = (img2 * np.array([0.256789, 0.504129, 0.097906])).sum(axis=2) + 16 / 255 * pixel_range
+    elif color_mode == 'yuv':
+        img1 = img1[:, 0, :, :]
+        img2 = img2[:, 0, :, :]
+    elif color_mode == 'y':
+        img1 = img1
+        img2 = img2
+    # img1 and img2 have range [0, pixel_range]
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    mse = np.mean((img1 - img2)**2)
+    if mse == 0:
+        return float('inf')
+    return 20 * math.log10(pixel_range / math.sqrt(mse))
 
-    Args:
-        path (str): path of TIF image
-    Returns:
-        np.array: value matrix in [C, H, W] or [H, W]
-    """
-    img = np.array(gdal.Open(path).ReadAsArray(), dtype=np.double)
-    return img
+def ssim(img1, img2, pixel_range=255, color_mode='rgb'):
+    C1 = (0.01 * pixel_range)**2
+    C2 = (0.03 * pixel_range)**2
 
+    # transfer color channel to y
+    if color_mode == 'rgb':
+        img1 = (img1 * np.array([0.256789, 0.504129, 0.097906])).sum(axis=2) + 16 / 255 * pixel_range
+        img2 = (img2 * np.array([0.256789, 0.504129, 0.097906])).sum(axis=2) + 16 / 255 * pixel_range
+    elif color_mode == 'yuv':
+        img1 = img1[:, 0, :, :]
+        img2 = img2[:, 0, :, :]
+    elif color_mode == 'y':
+        img1 = img1
+        img2 = img2
 
-def save_image(path, array):
-    """ Save np.array as .TIF image
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    kernel = cv2.getGaussianKernel(11, 1.5)
+    window = np.outer(kernel, kernel.transpose())
 
-    Args:
-        path (str): path to save as TIF image
-        np.array: shape like [C, H, W] or [H, W]
-    """
-    # Meaningless Default Value
-    raster_origin = (-123.25745, 45.43013)
-    pixel_width = 2.4
-    pixel_height = 2.4
+    mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]  # valid
+    mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
+    mu1_sq = mu1**2
+    mu2_sq = mu2**2
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = cv2.filter2D(img1**2, -1, window)[5:-5, 5:-5] - mu1_sq
+    sigma2_sq = cv2.filter2D(img2**2, -1, window)[5:-5, 5:-5] - mu2_sq
+    sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
 
-    if array.ndim == 3:
-        chans = array.shape[0]
-        cols = array.shape[2]
-        rows = array.shape[1]
-        origin_x = raster_origin[0]
-        origin_y = raster_origin[1]
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
+        (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean()
 
-        driver = gdal.GetDriverByName('GTiff')
-
-        out_raster = driver.Create(path, cols, rows, chans, gdal.GDT_UInt16)
-        # print(path, cols, rows, chans, out_raster)
-        out_raster.SetGeoTransform((origin_x, pixel_width, 0, origin_y, 0, pixel_height))
-        for i in range(1, chans + 1):
-            out_band = out_raster.GetRasterBand(i)
-            out_band.WriteArray(array[i - 1, :, :])
-        out_raster_srs = osr.SpatialReference()
-        out_raster_srs.ImportFromEPSG(4326)
-        out_raster.SetProjection(out_raster_srs.ExportToWkt())
-        out_band.FlushCache()
-    elif array.ndim == 2:
-        cols = array.shape[1]
-        rows = array.shape[0]
-        origin_x = raster_origin[0]
-        origin_y = raster_origin[1]
-
-        driver = gdal.GetDriverByName('GTiff')
-
-        out_raster = driver.Create(path, cols, rows, 1, gdal.GDT_UInt16)
-        out_raster.SetGeoTransform((origin_x, pixel_width, 0, origin_y, 0, pixel_height))
-
-        out_band = out_raster.GetRasterBand(1)
-        out_band.WriteArray(array[:, :])
-
-
-def data_augmentation(img_dict, aug_dict=None):
-    """ Data augmentation for training set
-
-    Args:
-        img_dict (dict[str, torch.Tensor]): images in torch.Tensor, shape like [N, C, H, W]
-        aug_dict (dict[str, float]): probability of each augmentation,
-            example: {'ud_flip' : 0.5, 'lr_flip' : 0.5, 'r4_crop' : 0.3, 'r2_crop': 0.3}
-    Returns:
-        dict[str, torch.Tensor]: images after augmentation
-    """
-
-    def flip(x, dim):
-        """ flip the image at axis=dim
-
-        Args:
-            x (torch.Tensor): image in torch.Tensor, shape like [N, C, H, W]
-            dim (int): 2 or 3, up-down or left-right flip
-        Returns:
-            torch.Tensor: image after flipping, shape like [N, C, H, W]
-        """
-        index_list = [i for i in range(x.size(dim)-1, -1, -1)]
-        return x[:, :, index_list, :] if dim is 2 else x[:, :, :, index_list]
-
-    def crop_resize(imgs, crop_st, n=4):
-        """ crop part of the image and up-sample to the same size
-
-        Args:
-            imgs (torch.Tensor): images in torch.Tensor, shape like [N, C, H, W]
-            crop_st (Tuple[int, int]): start point of cropping at [H, W]
-            n (int): zoom ratio (n - 1) / n
-        Returns:
-            torch.Tensor: images after the operation, shape like [N, C, H, W]
-        """
-        _, __, h, w = imgs.shape
-        imgs = imgs[:, :, crop_st[0]:h//n*(n-1)+crop_st[0], crop_st[1]:w//n*(n-1)+crop_st[1]]
-        imgs = interpolate(imgs, size=[h, w], mode='bicubic', align_corners=True)
-        return imgs
-
-    if type(aug_dict) is type(None):
-        return img_dict
-
-    need_aug = False
-    for aug in aug_dict:    # transfer the probability to Ture/False
-        aug_dict[aug] = (random() < aug_dict[aug])
-        need_aug = (need_aug or aug_dict[aug])
-
-    if not need_aug:
-        return img_dict
-
-    if 'r4_crop' in aug_dict and aug_dict['r4_crop']:
-        d1 = int(img_dict['input_lr'].size(2) // 4 * random())
-        d2 = int(img_dict['input_lr'].size(3) // 4 * random())
-    if 'r2_crop' in aug_dict and aug_dict['r2_crop']:
-        d3 = int(img_dict['input_lr'].size(2) // 2 * random())
-        d4 = int(img_dict['input_lr'].size(3) // 2 * random())
-
-    ret = dict(image_id=img_dict['image_id'])
-    for img_name in img_dict:
-        if img_name == 'image_id':
-            continue
-        imgs = img_dict[img_name]
-        if 'ud_flip' in aug_dict and aug_dict['ud_flip']:
-            ret[img_name] = flip(imgs, 2)
-        if 'lr_flip' in aug_dict and aug_dict['lr_flip']:
-            ret[img_name] = flip(imgs, 3)
-        if 'r4_crop' in aug_dict and aug_dict['r4_crop']:
-            ret[img_name] = crop_resize(
-                imgs, (d1, d2) if img_name in ['input_lr', 'input_pan_l'] else (d1*4, d2*4), 4
-            )
-        if 'r2_crop' in aug_dict and aug_dict['r2_crop']:
-            ret[img_name] = crop_resize(
-                imgs, (d3, d4) if img_name in ['input_lr', 'input_pan_l'] else (d3*4, d4*4), 2
-            )
-
-    return ret
-
-
-def data_normalize(img_dict, bit_depth):
-    """ Normalize the data to [0, 1)
-
-    Args:
-        img_dict (dict[str, torch.Tensor]): images in torch.Tensor
-        bit_depth (int): original data range in n-bit
-    Returns:
-        dict[str, torch.Tensor]: images after normalization
-    """
-    max_value = 2 ** bit_depth - .5
-    ret = dict()
-    for img_name in img_dict:
-        if img_name == 'image_id':
-            ret[img_name] = img_dict[img_name]
-            continue
-        imgs = img_dict[img_name]
-        ret[img_name] = imgs / max_value
-    return ret
-
-
-def data_denormalize(img, bit_depth):
-    """ Denormalize the data to [0, n-bit)
-
-    Args:
-        img (torch.Tensor | np.ndarray): images in torch.Tensor
-        bit_depth (int): original data range in n-bit
-    Returns:
-        dict[str, torch.Tensor]: image after denormalize
-    """
-    max_value = 2 ** bit_depth - .5
-    ret = img * max_value
-    return ret
+def calculate_ssim(img1, img2, pixel_range=255):
+    '''calculate SSIM
+    the same outputs as MATLAB's
+    img1, img2: [0, 255]
+    '''
+    if not img1.shape == img2.shape:
+        raise ValueError('Input images must have the same dimensions.')
+    if img1.ndim == 2:
+        return ssim(img1, img2, pixel_range)
+    elif img1.ndim == 3:
+        if img1.shape[2] == 3:
+            ssims = []
+            for i in range(3):
+                ssims.append(ssim(img1, img2, pixel_range))
+            return np.array(ssims).mean()
+        elif img1.shape[2] == 1:
+            return ssim(np.squeeze(img1), np.squeeze(img2), pixel_range)
+    else:
+        raise ValueError('Wrong input image dimensions.')

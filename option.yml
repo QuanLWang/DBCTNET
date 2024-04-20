@@ -1,0 +1,52 @@
+
+name: Net
+algorithm: MDCB
+nEpochs: 2000
+gpu_mode: False
+save_best: False
+gpus: [0, 1]
+threads: 8
+
+seed: 123
+checkpoint: checkpoint
+data_dir_train: ./dataset/train
+data_dir_eval: ./dataset/test
+source_ms: ms
+source_pan: pan
+
+pretrain:
+  pretrained: False
+  pre_sr: best.pth
+  pre_folder: checkpoint
+
+test:
+  algorithm: MDCB
+  type: test #[test, eval]
+  data_dir: ./dataset/test
+  source_ms: ms
+  source_pan: pan
+  model: best.pth
+
+data:
+  upsacle:  4
+  batch_size: 16
+  patch_size: 24
+  data_augmentation: False                                                                                                                                                                                               
+  n_colors: 4
+  rgb_range: 255
+  normalize : False
+  
+schedule:
+  lr: 0.0001
+  decay: 1000
+  gamma: 0.1
+  optimizer: ADAM
+  momentum: 0.9
+  beta1: 0.9
+  beta2: 0.999
+  epsilon: 1e-8
+  alpha: 0.9
+  weight_dency: 0
+  loss: L1
+
+
